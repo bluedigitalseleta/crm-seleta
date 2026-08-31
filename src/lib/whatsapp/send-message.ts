@@ -52,6 +52,7 @@ import {
   resolveTemplateRow,
   templateBodyParams,
   templateContentText,
+  type ResolvedTemplate,
 } from '@/lib/whatsapp/template-body';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
@@ -93,6 +94,8 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /** Meta / Evolution message ID to quote / reply to. */
+  contextMessageId?: string | null;
 }
 
 export interface SendMessageResult {
@@ -206,6 +209,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    contextMessageId,
   } = params;
 
   if (!conversationId) {
@@ -274,6 +278,19 @@ export async function sendMessageToConversation(
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
 
+  // Resolve template row + language once (used by Meta send + persisted text).
+  // Evolution doesn't support templates, but the persistedText calc below
+  // needs the row regardless of provider.
+  let resolvedTemplate: ResolvedTemplate | null = null;
+  if (messageType === 'template') {
+    resolvedTemplate = await resolveTemplateRow(
+      db,
+      accountId,
+      templateName!,
+      templateLanguage,
+    );
+  }
+
   if (config.provider === 'evolution') {
     const instanceName = config.provider_config?.instanceName;
     if (!instanceName) {
@@ -322,11 +339,11 @@ export async function sendMessageToConversation(
           accessToken,
           to: phone,
           templateName: templateName!,
-          language: sendLanguage,
-          template: templateRow ?? undefined,
+          language: resolvedTemplate?.language ?? templateLanguage ?? 'en_US',
+          template: resolvedTemplate?.row ?? undefined,
           messageParams: templateMessageParams ?? undefined,
           params: templateParams || [],
-          contextMessageId,
+          contextMessageId: contextMessageId ?? undefined,
         });
         return result.messageId;
       }
@@ -339,7 +356,7 @@ export async function sendMessageToConversation(
           link: mediaUrl!,
           caption: contentText || undefined,
           filename: filename || undefined,
-          contextMessageId,
+          contextMessageId: contextMessageId ?? undefined,
         });
         return result.messageId;
       }
@@ -354,7 +371,7 @@ export async function sendMessageToConversation(
             headerText: p.header || undefined,
             footerText: p.footer || undefined,
             buttons: p.buttons,
-            contextMessageId,
+            contextMessageId: contextMessageId ?? undefined,
           });
           return result.messageId;
         }
@@ -367,7 +384,7 @@ export async function sendMessageToConversation(
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
           sections: p.sections,
-          contextMessageId,
+          contextMessageId: contextMessageId ?? undefined,
         });
         return result.messageId;
       }
@@ -376,7 +393,7 @@ export async function sendMessageToConversation(
         accessToken,
         to: phone,
         text: contentText!,
-        contextMessageId,
+        contextMessageId: contextMessageId ?? undefined,
       });
       return result.messageId;
     };
@@ -438,7 +455,7 @@ export async function sendMessageToConversation(
       ? interactivePayload!.body
       : messageType === 'template'
         ? templateContentText(
-            templateRow,
+            resolvedTemplate?.row ?? null,
             templateBodyParams(templateParams, templateMessageParams),
             contentText
           )
