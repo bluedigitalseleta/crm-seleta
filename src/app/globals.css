@@ -217,6 +217,20 @@ html[data-theme="rose"] {
   --sidebar-ring: oklch(0.645 0.22 16);
 }
 
+html[data-theme="yellow"] {
+  --primary: oklch(0.82 0.16 95);
+  --primary-foreground: oklch(0.18 0.04 95);
+  --primary-hover: oklch(0.87 0.15 95);
+  --primary-soft: oklch(0.82 0.16 95 / 0.12);
+  --primary-soft-2: oklch(0.82 0.16 95 / 0.22);
+  --ring: oklch(0.82 0.16 95);
+  --chart-1: oklch(0.82 0.16 95);
+  --chart-2: oklch(0.7 0.14 45);
+  --sidebar-primary: oklch(0.82 0.16 95);
+  --sidebar-primary-foreground: oklch(0.18 0.04 95);
+  --sidebar-ring: oklch(0.82 0.16 95);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
