@@ -13,6 +13,7 @@ import {
   Zap,
   AlertTriangle,
   RotateCcw,
+  RefreshCw,
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
@@ -77,6 +78,12 @@ export function WhatsAppConfig() {
   const [pin, setPin] = useState('');
   const [tokenEdited, setTokenEdited] = useState(false);
 
+  // Provider selection (meta | evolution)
+  const [provider, setProvider] = useState<'meta' | 'evolution'>('meta');
+  const [instanceName, setInstanceName] = useState('');
+  const [qrCodeData, setQrCodeData] = useState<string | null>(null);
+  const [evolutionConnecting, setEvolutionConnecting] = useState(false);
+
   // Inbound-media mirror (issue #466). Unlike everything else on this
   // page it is NOT part of handleSave: that path insists on re-entering
   // the access token so it can re-verify with Meta, which is a silly
@@ -108,7 +115,7 @@ export function WhatsAppConfig() {
 
   const webhookUrl =
     typeof window !== 'undefined'
-      ? `${window.location.origin}/api/whatsapp/webhook`
+      ? `${window.location.origin}/api/whatsapp/${provider === 'evolution' ? 'evolution-webhook' : 'webhook'}`
       : '';
 
   const fetchConfig = useCallback(async (acctId: string) => {
@@ -132,12 +139,19 @@ export function WhatsAppConfig() {
 
       if (data) {
         setConfig(data);
-        setPhoneNumberId(data.phone_number_id || '');
-        setWabaId(data.waba_id || '');
-        setAccessToken(MASKED_TOKEN);
-        setVerifyToken('');
-        setPin('');
-        setTokenEdited(false);
+        // Detect provider from saved config
+        const savedProvider = (data.provider as 'meta' | 'evolution') || 'meta';
+        setProvider(savedProvider);
+        if (savedProvider === 'evolution') {
+          setInstanceName(data.provider_config?.instanceName || '');
+        } else {
+          setPhoneNumberId(data.phone_number_id || '');
+          setWabaId(data.waba_id || '');
+          setAccessToken(MASKED_TOKEN);
+          setVerifyToken('');
+          setPin('');
+          setTokenEdited(false);
+        }
         // Undefined on a row read before migration 039 — treat that as
         // on, matching the webhook's own default.
         setMirrorMedia(data.mirror_inbound_media !== false);
@@ -164,6 +178,8 @@ export function WhatsAppConfig() {
             setConnectionStatus('connected');
             setResetReason(null);
             setStatusMessage('');
+            // QR code is no longer needed once the instance is connected
+            if (data.provider === 'evolution') setQrCodeData(null);
           } else {
             setConnectionStatus('disconnected');
             setResetReason(payload.needs_reset ? 'token_corrupted' : payload.reason === 'meta_api_error' ? 'meta_api_error' : null);
@@ -227,42 +243,50 @@ export function WhatsAppConfig() {
   }
 
   async function handleSave() {
-    if (!phoneNumberId.trim()) {
-      toast.error('Phone Number ID is required');
-      return;
-    }
-    if (!config && (!accessToken.trim() || !tokenEdited)) {
-      toast.error('Access Token is required for initial setup');
-      return;
-    }
-
     try {
       setSaving(true);
+      if (provider === 'evolution') setEvolutionConnecting(true);
 
-      // Always POST through the API — it verifies with Meta and encrypts
-      // the access_token server-side with ENCRYPTION_KEY. Skipping this
-      // and writing direct to Supabase stores the token in plaintext,
-      // which then fails decryption on every subsequent health check.
-      const payload: Record<string, unknown> = {
-        phone_number_id: phoneNumberId.trim(),
-        waba_id: wabaId.trim() || null,
-        verify_token: verifyToken.trim() || null,
-        // Optional — only sent when the user filled it in. The server
-        // requires it on first save or when changing numbers; for a
-        // simple token rotation, leaving it blank skips re-register.
-        pin: pin.trim() || null,
-      };
+      let payload: Record<string, unknown>;
 
-      if (tokenEdited && accessToken !== MASKED_TOKEN && accessToken.trim()) {
-        payload.access_token = accessToken.trim();
-      } else if (config) {
-        // Existing config — reuse stored encrypted token by decrypting on the
-        // server. But our POST handler requires an access_token to verify
-        // with Meta. If the user didn't change the token, we need to signal
-        // that. Simplest: require token re-entry if they're updating.
-        toast.error('Please re-enter the Access Token to save changes');
-        setSaving(false);
-        return;
+      if (provider === 'evolution') {
+        if (!instanceName.trim()) {
+          toast.error('Instance name is required');
+          setSaving(false);
+          return;
+        }
+        payload = {
+          provider: 'evolution',
+          instanceName: instanceName.trim(),
+        };
+      } else {
+        // Meta API validation
+        if (!phoneNumberId.trim()) {
+          toast.error('Phone Number ID is required');
+          setSaving(false);
+          return;
+        }
+        if (!config && (!accessToken.trim() || !tokenEdited)) {
+          toast.error('Access Token is required for initial setup');
+          setSaving(false);
+          return;
+        }
+
+        payload = {
+          provider: 'meta',
+          phone_number_id: phoneNumberId.trim(),
+          waba_id: wabaId.trim() || null,
+          verify_token: verifyToken.trim() || null,
+          pin: pin.trim() || null,
+        };
+
+        if (tokenEdited && accessToken !== MASKED_TOKEN && accessToken.trim()) {
+          payload.access_token = accessToken.trim();
+        } else if (config) {
+          toast.error('Please re-enter the Access Token to save changes');
+          setSaving(false);
+          return;
+        }
       }
 
       const res = await fetch('/api/whatsapp/config', {
@@ -285,7 +309,14 @@ export function WhatsAppConfig() {
       //                         failed; UI shows the specific error
       //                         and a retry path. registration_error
       //                         is human-readable from Meta.
-      if (data.registered === false && data.registration_error) {
+      if (provider === 'evolution') {
+        if (data.qrcode) {
+          setQrCodeData(data.qrcode);
+          toast.success('Evolution instance created. Scan the QR code to connect.');
+        } else {
+          toast.success('Evolution instance created. Waiting for QR code...');
+        }
+      } else if (data.registered === false && data.registration_error) {
         toast.error(
           `Saved, but Meta couldn't register the number: ${data.registration_error}`,
           { duration: 12000 },
@@ -318,6 +349,7 @@ export function WhatsAppConfig() {
       toast.error('Failed to save configuration');
     } finally {
       setSaving(false);
+      setEvolutionConnecting(false);
     }
   }
 
@@ -331,10 +363,13 @@ export function WhatsAppConfig() {
         setConnectionStatus('connected');
         setResetReason(null);
         setStatusMessage('');
+        const name = payload.phone_info?.verified_name || '';
         toast.success(
-          payload.phone_info?.verified_name
-            ? `Connected to ${payload.phone_info.verified_name}`
-            : 'API connection successful'
+          provider === 'evolution'
+            ? `Connected to Evolution: ${name.replace('Evolution: ', '')}`
+            : name
+              ? `Connected to ${name}`
+              : 'API connection successful'
         );
       } else {
         setConnectionStatus('disconnected');
@@ -399,6 +434,8 @@ export function WhatsAppConfig() {
       setAccessToken('');
       setVerifyToken('');
       setTokenEdited(false);
+      setInstanceName('');
+      setQrCodeData(null);
       setConnectionStatus('disconnected');
       setResetReason(null);
       setStatusMessage('');
@@ -413,6 +450,37 @@ export function WhatsAppConfig() {
   function handleCopyWebhookUrl() {
     navigator.clipboard.writeText(webhookUrl);
     toast.success('Webhook URL copied to clipboard');
+  }
+
+  async function handleRefreshQrCode() {
+    if (!instanceName.trim()) return;
+    try {
+      setEvolutionConnecting(true);
+      const res = await fetch('/api/whatsapp/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'evolution',
+          instanceName: instanceName.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data.error || 'Failed to refresh QR code');
+        return;
+      }
+      if (data.qrcode) {
+        setQrCodeData(data.qrcode);
+        toast.success('QR code refreshed. Scan it now.');
+      } else {
+        toast.error('No QR code returned. The instance may already be connected.');
+      }
+    } catch (err) {
+      console.error('Refresh QR error:', err);
+      toast.error('Failed to refresh QR code');
+    } finally {
+      setEvolutionConnecting(false);
+    }
   }
 
   if (loading) {
@@ -437,485 +505,620 @@ export function WhatsAppConfig() {
         title={t("title")}
         description={t("description")}
       />
-      <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
-      {/* Main config form */}
-      <div className="space-y-6">
-        {/* Corrupted-token reset banner */}
-        {showResetBanner && (
-          <Alert className="bg-amber-950/40 border-amber-600/40">
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="size-5 text-amber-400 mt-0.5 shrink-0" />
-              <div className="flex-1">
-                <AlertTitle className="text-amber-200 mb-1">
-                  Stored token can&apos;t be decrypted
-                </AlertTitle>
-                <AlertDescription className="text-amber-100/80 text-sm">
-                  {statusMessage}
-                </AlertDescription>
-                <Button
-                  onClick={handleReset}
-                  disabled={resetting}
-                  size="sm"
-                  className="mt-3 bg-amber-600 hover:bg-amber-700 text-white"
-                >
-                  {resetting ? (
-                    <>
-                      <Loader2 className="size-4 animate-spin" />
-                      {t('resetting')}
-                    </>
-                  ) : (
-                    <>
-                      <RotateCcw className="size-4" />
-                      {t('resetConfig')}
-                    </>
-                  )}
-                </Button>
+      <div className={`grid gap-6 ${provider === 'meta' ? 'lg:grid-cols-[1fr_380px]' : ''}`}>
+        {/* Main config form */}
+        <div className="space-y-6">
+          {/* Corrupted-token reset banner */}
+          {showResetBanner && (
+            <Alert className="bg-amber-950/40 border-amber-600/40">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="size-5 text-amber-400 mt-0.5 shrink-0" />
+                <div className="flex-1">
+                  <AlertTitle className="text-amber-200 mb-1">
+                    Stored token can&apos;t be decrypted
+                  </AlertTitle>
+                  <AlertDescription className="text-amber-100/80 text-sm">
+                    {statusMessage}
+                  </AlertDescription>
+                  <Button
+                    onClick={handleReset}
+                    disabled={resetting}
+                    size="sm"
+                    className="mt-3 bg-amber-600 hover:bg-amber-700 text-white"
+                  >
+                    {resetting ? (
+                      <>
+                        <Loader2 className="size-4 animate-spin" />
+                        {t('resetting')}
+                      </>
+                    ) : (
+                      <>
+                        <RotateCcw className="size-4" />
+                        {t('resetConfig')}
+                      </>
+                    )}
+                  </Button>
+                </div>
               </div>
-            </div>
-          </Alert>
-        )}
+            </Alert>
+          )}
 
-        {/* Connection Status */}
-        <Alert className="bg-card border-border">
-          <div className="flex items-center gap-2">
-            {connectionStatus === 'connected' ? (
-              <CheckCircle2 className="size-4 text-primary" />
-            ) : (
-              <XCircle className="size-4 text-red-500" />
-            )}
-            <AlertTitle className="text-foreground mb-0">
-              {connectionStatus === 'connected' ? t('credentialsValid') : t('notConnected')}
-            </AlertTitle>
-          </div>
-          <AlertDescription className="text-muted-foreground">
-            {connectionStatus === 'connected'
-              ? t('connectedDesc')
-              : statusMessage ||
-                t('notConnectedDesc')}
-          </AlertDescription>
-        </Alert>
-
-        {/* Registration Status — the "is it actually live?" check.
-            Credentials being valid is necessary but not sufficient;
-            without a successful /register call the number won't
-            receive inbound events. Surface this dimension separately
-            so users don't trust a misleading green banner. */}
-        {config && (
-          <Alert
-            className={
-              isRegistered
-                ? 'bg-emerald-950/30 border-emerald-700/50'
-                : 'bg-amber-950/30 border-amber-700/50'
-            }
-          >
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <div className="flex items-center gap-2">
-                {isRegistered ? (
-                  <CheckCircle2 className="size-4 text-emerald-400" />
-                ) : (
-                  <AlertTriangle className="size-4 text-amber-400" />
-                )}
-                <AlertTitle
-                  className={
-                    'mb-0 ' + (isRegistered ? 'text-emerald-200' : 'text-amber-200')
-                  }
-                >
-                  {isRegistered
-                    ? t('registered')
-                    : t('notRegistered')}
-                </AlertTitle>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleVerifyRegistration}
-                disabled={verifyingRegistration}
-                className="border-border bg-transparent text-foreground hover:bg-muted h-7"
-              >
-                {verifyingRegistration ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <Zap className="size-3.5" />
-                )}
-                {t('verifyWithMeta')}
-              </Button>
-            </div>
-            <AlertDescription className="text-muted-foreground mt-2 text-xs leading-relaxed">
-              {isRegistered ? (
-                <span
-                  dangerouslySetInnerHTML={{
-                    __html: t('subscribedSince', {
-                      date: config.registered_at
-                        ? new Date(config.registered_at).toLocaleString()
-                        : t('unknownDate'),
-                    }),
-                  }}
-                />
-              ) : lastRegistrationError ? (
-                <>
-                  {t('lastAttemptFailed')}
-                  <span className="text-red-300">
-                    &quot;{lastRegistrationError}&quot;
-                  </span>
-                  . {t('retryHint')}
-                </>
+          {/* Connection Status */}
+          <Alert className="bg-card border-border">
+            <div className="flex items-center gap-2">
+              {connectionStatus === 'connected' ? (
+                <CheckCircle2 className="size-4 text-primary" />
               ) : (
-                <>{t('noRegistrationHint')}</>
+                <XCircle className="size-4 text-red-500" />
               )}
+              <AlertTitle className="text-foreground mb-0">
+                {connectionStatus === 'connected'
+                  ? provider === 'evolution'
+                    ? t('evolutionConnected')
+                    : t('credentialsValid')
+                  : t('notConnected')}
+              </AlertTitle>
+            </div>
+            <AlertDescription className="text-muted-foreground">
+              {connectionStatus === 'connected'
+                ? provider === 'evolution'
+                  ? `${t('evolutionQrDesc')}`
+                  : t('connectedDesc')
+                : statusMessage ||
+                (provider === 'evolution'
+                  ? t('providerEvolutionDesc')
+                  : t('notConnectedDesc'))}
             </AlertDescription>
-
-            {registrationProbe && (
-              <div className="mt-3 rounded border border-border bg-card/60 px-3 py-2 space-y-1.5 text-[11px]">
-                <p className="font-medium text-foreground">
-                  {t('diagnosticLastRun')}
-                  <span className={registrationProbe.live ? 'text-emerald-400' : 'text-amber-400'}>
-                    {registrationProbe.live ? t('live') : t('notLive')}
-                  </span>
-                </p>
-                <ul className="space-y-0.5 text-muted-foreground">
-                  {Object.entries(registrationProbe.checks).map(([k, v]) => (
-                    <li key={k} className="flex items-center gap-1.5">
-                      {v === true ? (
-                        <CheckCircle2 className="size-3 text-emerald-400 shrink-0" />
-                      ) : v === false ? (
-                        <XCircle className="size-3 text-red-400 shrink-0" />
-                      ) : (
-                        <span className="size-3 rounded-full border border-border shrink-0" />
-                      )}
-                      <code className="text-muted-foreground">{k}</code>
-                    </li>
-                  ))}
-                </ul>
-                {(registrationProbe.errors ?? []).length > 0 && (
-                  <ul className="pt-1 space-y-0.5 text-red-300">
-                    {registrationProbe.errors?.map((e, i) => (
-                      <li key={i}>• {e}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
           </Alert>
-        )}
 
-        {/* API Credentials */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-foreground">{t('apiCredentialsTitle')}</CardTitle>
-            <CardDescription className="text-muted-foreground">
-              {t('apiCredentialsDesc')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">{t('phoneNumberId')}</Label>
-              <Input
-                placeholder="e.g. 100234567890123"
-                value={phoneNumberId}
-                onChange={(e) => setPhoneNumberId(e.target.value)}
-                className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">{t('wabaId')}</Label>
-              <Input
-                placeholder="e.g. 100234567890456"
-                value={wabaId}
-                onChange={(e) => setWabaId(e.target.value)}
-                className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">{t('accessToken')}</Label>
-              <div className="relative">
-                <Input
-                  type={showToken ? 'text' : 'password'}
-                  placeholder={t('accessTokenPlaceholder')}
-                  value={accessToken}
-                  onChange={(e) => {
-                    setAccessToken(e.target.value);
-                    setTokenEdited(true);
-                  }}
-                  onFocus={() => {
-                    if (accessToken === MASKED_TOKEN) {
-                      setAccessToken('');
-                      setTokenEdited(true);
-                    }
-                  }}
-                  className="bg-muted border-border text-foreground placeholder:text-muted-foreground pr-10"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowToken(!showToken)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {showToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                </button>
-              </div>
-              {config && !tokenEdited && (
-                <p className="text-xs text-muted-foreground">
-                  {t('tokenHidden')}
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">{t('webhookVerifyToken')}</Label>
-              <Input
-                placeholder={t('webhookVerifyTokenPlaceholder')}
-                value={verifyToken}
-                onChange={(e) => setVerifyToken(e.target.value)}
-                className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
-              />
-              <p className="text-xs text-muted-foreground">
-                {t('webhookVerifyTokenHint')}
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">
-                {t('twoStepPin')}
-                <span className="ml-1 text-muted-foreground">{t('optional')}</span>
-              </Label>
-              <Input
-                type="text"
-                inputMode="numeric"
-                maxLength={6}
-                placeholder={t('pinPlaceholder')}
-                value={pin}
-                onChange={(e) =>
-                  setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                }
-                className="bg-muted border-border text-foreground placeholder:text-muted-foreground tracking-widest"
-              />
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                <span dangerouslySetInnerHTML={{ __html: t('pinHint') }} />
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Webhook URL */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-foreground">{t('webhookTitle')}</CardTitle>
-            <CardDescription className="text-muted-foreground">
-              {t('webhookDesc')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">{t('webhookUrl')}</Label>
-              <div className="flex gap-2">
-                <Input
-                  readOnly
-                  value={webhookUrl}
-                  className="bg-muted border-border text-muted-foreground font-mono text-sm"
-                />
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={handleCopyWebhookUrl}
-                  className="shrink-0 border-border text-muted-foreground hover:text-foreground hover:bg-muted"
-                >
-                  <Copy className="size-4" />
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Attachment retention. Only meaningful once a number is
-            connected, since it governs what the webhook does with
-            inbound media. */}
-        {config && (
+          {/* Provider Selector */}
           <Card>
             <CardHeader>
-              <CardTitle className="text-foreground">{t('mediaTitle')}</CardTitle>
+              <CardTitle className="text-foreground">{t('providerLabel')}</CardTitle>
               <CardDescription className="text-muted-foreground">
-                {t('mediaDesc')}
+                {provider === 'evolution' ? t('providerEvolutionDesc') : t('providerMetaDesc')}
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="flex items-center justify-between gap-4 rounded-md border border-border p-3">
-                <div>
-                  <p className="text-sm font-medium text-foreground">
-                    {t('mirrorInbound')}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {t('mirrorInboundDesc')}
-                  </p>
-                  {!mirrorMedia && (
-                    <p className="mt-1 text-xs text-amber-600 dark:text-amber-500">
-                      {t('mirrorInboundOffWarning')}
-                    </p>
-                  )}
-                </div>
-                <Switch
-                  checked={mirrorMedia}
-                  onCheckedChange={handleToggleMirrorMedia}
-                  disabled={savingMirror || !canEditSettings}
-                  aria-label={t('mirrorInbound')}
-                />
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setProvider('meta')}
+                  className={`rounded-lg border p-4 text-left transition-colors ${provider === 'meta'
+                      ? 'border-primary bg-primary/10 text-foreground'
+                      : 'border-border bg-muted/50 text-muted-foreground hover:bg-muted'
+                    }`}
+                >
+                  <p className="font-medium">{t('providerMeta')}</p>
+                  <p className="mt-1 text-xs opacity-70">Official Cloud API</p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProvider('evolution')}
+                  className={`rounded-lg border p-4 text-left transition-colors ${provider === 'evolution'
+                      ? 'border-primary bg-primary/10 text-foreground'
+                      : 'border-border bg-muted/50 text-muted-foreground hover:bg-muted'
+                    }`}
+                >
+                  <p className="font-medium">{t('providerEvolution')}</p>
+                  <p className="mt-1 text-xs opacity-70">Baileys / Community</p>
+                </button>
               </div>
             </CardContent>
           </Card>
-        )}
 
-        {/* Action Buttons */}
-        <div className="flex flex-wrap gap-3">
-          <Button
-            onClick={handleSave}
-            disabled={saving}
-            className="bg-primary hover:bg-primary/90 text-primary-foreground"
-          >
-            {saving ? (
-              <>
-                <Loader2 className="size-4 animate-spin" />
-                {t('saving')}
-              </>
-            ) : (
-              t('saveConfig')
-            )}
-          </Button>
-          <Button
-            variant="outline"
-            onClick={handleTestConnection}
-            disabled={testing || !config}
-            className="border-border text-muted-foreground hover:text-foreground hover:bg-muted"
-          >
-            {testing ? (
-              <>
-                <Loader2 className="size-4 animate-spin" />
-                {t('testing')}
-              </>
-            ) : (
-              <>
-                <Zap className="size-4" />
-                {t('testConnection')}
-              </>
-            )}
-          </Button>
-          {config && (
-            <Button
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetting}
-              className="border-red-900 text-red-400 hover:text-red-300 hover:bg-red-950/40"
+          {/* Registration Status — Meta API only.
+            Uses CSS hidden instead of conditional rendering to avoid
+            React DOM reconciliation removeChild errors. */}
+          <div hidden={!(config && provider === 'meta')}>
+            <Alert
+              className={
+                isRegistered
+                  ? 'bg-emerald-950/30 border-emerald-700/50'
+                  : 'bg-amber-950/30 border-amber-700/50'
+              }
             >
-              {resetting ? (
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  {isRegistered ? (
+                    <CheckCircle2 className="size-4 text-emerald-400" />
+                  ) : (
+                    <AlertTriangle className="size-4 text-amber-400" />
+                  )}
+                  <AlertTitle
+                    className={
+                      'mb-0 ' + (isRegistered ? 'text-emerald-200' : 'text-amber-200')
+                    }
+                  >
+                    {isRegistered
+                      ? t('registered')
+                      : t('notRegistered')}
+                  </AlertTitle>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleVerifyRegistration}
+                  disabled={verifyingRegistration}
+                  className="border-border bg-transparent text-foreground hover:bg-muted h-7"
+                >
+                  {verifyingRegistration ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Zap className="size-3.5" />
+                  )}
+                  {t('verifyWithMeta')}
+                </Button>
+              </div>
+              <AlertDescription className="text-muted-foreground mt-2 text-xs leading-relaxed">
+                {isRegistered ? (
+                  <span
+                    dangerouslySetInnerHTML={{
+                      __html: t('subscribedSince', {
+                        date: config?.registered_at
+                          ? new Date(config.registered_at).toLocaleString()
+                          : t('unknownDate'),
+                      }),
+                    }}
+                  />
+                ) : lastRegistrationError ? (
+                  <>
+                    {t('lastAttemptFailed')}
+                    <span className="text-red-300">
+                      &quot;{lastRegistrationError}&quot;
+                    </span>
+                    . {t('retryHint')}
+                  </>
+                ) : (
+                  <>{t('noRegistrationHint')}</>
+                )}
+              </AlertDescription>
+
+              {registrationProbe && (
+                <div className="mt-3 rounded border border-border bg-card/60 px-3 py-2 space-y-1.5 text-[11px]">
+                  <p className="font-medium text-foreground">
+                    {t('diagnosticLastRun')}
+                    <span className={registrationProbe.live ? 'text-emerald-400' : 'text-amber-400'}>
+                      {registrationProbe.live ? t('live') : t('notLive')}
+                    </span>
+                  </p>
+                  <ul className="space-y-0.5 text-muted-foreground">
+                    {Object.entries(registrationProbe.checks).map(([k, v]) => (
+                      <li key={k} className="flex items-center gap-1.5">
+                        {v === true ? (
+                          <CheckCircle2 className="size-3 text-emerald-400 shrink-0" />
+                        ) : v === false ? (
+                          <XCircle className="size-3 text-red-400 shrink-0" />
+                        ) : (
+                          <span className="size-3 rounded-full border border-border shrink-0" />
+                        )}
+                        <code className="text-muted-foreground">{k}</code>
+                      </li>
+                    ))}
+                  </ul>
+                  {(registrationProbe.errors ?? []).length > 0 && (
+                    <ul className="pt-1 space-y-0.5 text-red-300">
+                      {registrationProbe.errors?.map((e, i) => (
+                        <li key={i}>• {e}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </Alert>
+          </div>
+
+          {/* API Credentials — Meta API only. CSS hidden to avoid removeChild. */}
+          <div hidden={provider !== 'meta'}>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-foreground">{t('apiCredentialsTitle')}</CardTitle>
+                <CardDescription className="text-muted-foreground">
+                  {t('apiCredentialsDesc')}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('phoneNumberId')}</Label>
+                  <Input
+                    placeholder="e.g. 100234567890123"
+                    value={phoneNumberId}
+                    onChange={(e) => setPhoneNumberId(e.target.value)}
+                    className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('wabaId')}</Label>
+                  <Input
+                    placeholder="e.g. 100234567890456"
+                    value={wabaId}
+                    onChange={(e) => setWabaId(e.target.value)}
+                    className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('accessToken')}</Label>
+                  <div className="relative">
+                    <Input
+                      type={showToken ? 'text' : 'password'}
+                      placeholder={t('accessTokenPlaceholder')}
+                      value={accessToken}
+                      onChange={(e) => {
+                        setAccessToken(e.target.value);
+                        setTokenEdited(true);
+                      }}
+                      onFocus={() => {
+                        if (accessToken === MASKED_TOKEN) {
+                          setAccessToken('');
+                          setTokenEdited(true);
+                        }
+                      }}
+                      className="bg-muted border-border text-foreground placeholder:text-muted-foreground pr-10"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowToken(!showToken)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {showToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                    </button>
+                  </div>
+                  {config && !tokenEdited && (
+                    <p className="text-xs text-muted-foreground">
+                      {t('tokenHidden')}
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('webhookVerifyToken')}</Label>
+                  <Input
+                    placeholder={t('webhookVerifyTokenPlaceholder')}
+                    value={verifyToken}
+                    onChange={(e) => setVerifyToken(e.target.value)}
+                    className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('webhookVerifyTokenHint')}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">
+                    {t('twoStepPin')}
+                    <span className="ml-1 text-muted-foreground">{t('optional')}</span>
+                  </Label>
+                  <Input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder={t('pinPlaceholder')}
+                    value={pin}
+                    onChange={(e) =>
+                      setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                    }
+                    className="bg-muted border-border text-foreground placeholder:text-muted-foreground tracking-widest"
+                  />
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    <span dangerouslySetInnerHTML={{ __html: t('pinHint') }} />
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Evolution API — Instance + QR Code. CSS hidden to avoid removeChild. */}
+          <div hidden={provider !== 'evolution'}>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-foreground">{t('providerEvolution')}</CardTitle>
+                <CardDescription className="text-muted-foreground">
+                  {t('providerEvolutionDesc')}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('evolutionInstanceName')}</Label>
+                  <Input
+                    placeholder={t('evolutionInstanceNamePlaceholder')}
+                    value={instanceName}
+                    onChange={(e) => setInstanceName(e.target.value)}
+                    disabled={evolutionConnecting}
+                    className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+                  />
+                </div>
+
+                {/* QR Code display */}
+                {qrCodeData && (
+                  <div className="rounded-lg border border-border bg-card/60 p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-medium text-foreground">{t('evolutionQrTitle')}</p>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleRefreshQrCode}
+                        disabled={evolutionConnecting}
+                        className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                      >
+                        <RefreshCw className={`size-3.5 ${evolutionConnecting ? 'animate-spin' : ''}`} />
+                        {t('evolutionRefreshQr')}
+                      </Button>
+                    </div>
+                    <div className="flex justify-center">
+                      <img
+                        src={qrCodeData}
+                        alt="Evolution QR Code"
+                        className="h-64 w-64 rounded-lg border border-border"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground text-center">
+                      {t('evolutionQrDesc')}
+                    </p>
+                  </div>
+                )}
+
+                {/* Connected state with no QR */}
+                {connectionStatus === 'connected' && !qrCodeData && config && (
+                  <div className="rounded-lg border border-emerald-700/50 bg-emerald-950/30 p-4">
+                    <div className="flex items-center gap-2">
+                      <CheckCircle2 className="size-4 text-emerald-400" />
+                      <p className="text-sm font-medium text-emerald-200">{t('evolutionConnected')}</p>
+                    </div>
+                    <p className="mt-1 text-xs text-emerald-100/70">
+                      {instanceName && `Instance: ${instanceName}`}
+                    </p>
+                  </div>
+                )}
+
+                {/* Disconnected state hint */}
+                {connectionStatus === 'disconnected' && config && !qrCodeData && (
+                  <div className="rounded-lg border border-border bg-muted/30 p-4">
+                    <p className="text-sm text-muted-foreground">
+                      {t('evolutionDisconnected')}
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRefreshQrCode}
+                      disabled={evolutionConnecting || !instanceName.trim()}
+                      className="mt-3 border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                    >
+                      {evolutionConnecting ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="size-3.5" />
+                      )}
+                      {t('evolutionRefreshQr')}
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Webhook URL — Meta API only. CSS hidden to avoid removeChild. */}
+          <div hidden={provider !== 'meta'}>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-foreground">{t('webhookTitle')}</CardTitle>
+                <CardDescription className="text-muted-foreground">
+                  {t('webhookDesc')}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  <Label className="text-muted-foreground">{t('webhookUrl')}</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      readOnly
+                      value={webhookUrl}
+                      className="bg-muted border-border text-muted-foreground font-mono text-sm"
+                    />
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      onClick={handleCopyWebhookUrl}
+                      className="shrink-0 border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+                    >
+                      <Copy className="size-4" />
+                    </Button>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Attachment retention. Only meaningful once a number is
+            connected, since it governs what the webhook does with
+            inbound media. */}
+          {config && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-foreground">{t('mediaTitle')}</CardTitle>
+                <CardDescription className="text-muted-foreground">
+                  {t('mediaDesc')}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center justify-between gap-4 rounded-md border border-border p-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">
+                      {t('mirrorInbound')}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {t('mirrorInboundDesc')}
+                    </p>
+                    {!mirrorMedia && (
+                      <p className="mt-1 text-xs text-amber-600 dark:text-amber-500">
+                        {t('mirrorInboundOffWarning')}
+                      </p>
+                    )}
+                  </div>
+                  <Switch
+                    checked={mirrorMedia}
+                    onCheckedChange={handleToggleMirrorMedia}
+                    disabled={savingMirror || !canEditSettings}
+                    aria-label={t('mirrorInbound')}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Action Buttons */}
+          <div className="flex flex-wrap gap-3">
+            <Button
+              onClick={handleSave}
+              disabled={saving}
+              className="bg-primary hover:bg-primary/90 text-primary-foreground"
+            >
+              {saving ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  {t('resetting')}
+                  {provider === 'evolution' ? t('evolutionConnecting') : t('saving')}
+                </>
+              ) : (
+                provider === 'evolution' ? t('evolutionConnect') : t('saveConfig')
+              )}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleTestConnection}
+              disabled={testing || !config}
+              className="border-border text-muted-foreground hover:text-foreground hover:bg-muted"
+            >
+              {testing ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  {t('testing')}
                 </>
               ) : (
                 <>
-                  <RotateCcw className="size-4" />
-                  {t('resetConfig')}
+                  <Zap className="size-4" />
+                  {t('testConnection')}
                 </>
               )}
             </Button>
-          )}
+            {config && (
+              <Button
+                variant="outline"
+                onClick={handleReset}
+                disabled={resetting}
+                className="border-red-900 text-red-400 hover:text-red-300 hover:bg-red-950/40"
+              >
+                {resetting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    {t('resetting')}
+                  </>
+                ) : (
+                  <>
+                    <RotateCcw className="size-4" />
+                    {t('resetConfig')}
+                  </>
+                )}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {/* Setup Instructions Sidebar — Meta API only. CSS hidden to avoid removeChild. */}
+        <div hidden={provider !== 'meta'}>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-foreground text-base">{t('setupInstructions')}</CardTitle>
+              <CardDescription className="text-muted-foreground">
+                {t('setupInstructionsDesc')}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Accordion>
+                <AccordionItem className="border-border">
+                  <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
+                    <span className="flex items-center gap-2">
+                      <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">1</span>
+                      {t('step1')}
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent className="text-muted-foreground">
+                    <ol className="list-decimal list-inside space-y-1 text-sm">
+                      <li dangerouslySetInnerHTML={{ __html: t('step1_1') }} />
+                      <li>{t('step1_2')}</li>
+                      <li>{t('step1_3')}</li>
+                      <li>{t('step1_4')}</li>
+                    </ol>
+                  </AccordionContent>
+                </AccordionItem>
+
+                <AccordionItem className="border-border">
+                  <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
+                    <span className="flex items-center gap-2">
+                      <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">2</span>
+                      {t('step2')}
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent className="text-muted-foreground">
+                    <ol className="list-decimal list-inside space-y-1 text-sm">
+                      <li>{t('step2_1')}</li>
+                      <li>{t('step2_2')}</li>
+                      <li>{t('step2_3')}</li>
+                    </ol>
+                  </AccordionContent>
+                </AccordionItem>
+
+                <AccordionItem className="border-border">
+                  <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
+                    <span className="flex items-center gap-2">
+                      <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">3</span>
+                      {t('step3')}
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent className="text-muted-foreground">
+                    <ol className="list-decimal list-inside space-y-1 text-sm">
+                      <li>{t('step3_1')}</li>
+                      <li dangerouslySetInnerHTML={{ __html: t.raw('step3_2') }} />
+                      <li dangerouslySetInnerHTML={{ __html: t.raw('step3_3') }} />
+                      <li dangerouslySetInnerHTML={{ __html: t.raw('step3_4') }} />
+                    </ol>
+                  </AccordionContent>
+                </AccordionItem>
+
+                <AccordionItem className="border-border">
+                  <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
+                    <span className="flex items-center gap-2">
+                      <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">4</span>
+                      {t('step4')}
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent className="text-muted-foreground">
+                    <ol className="list-decimal list-inside space-y-1 text-sm">
+                      <li>{t('step4_1')}</li>
+                      <li>{t('step4_2')}</li>
+                      <li dangerouslySetInnerHTML={{ __html: t.raw('step4_3') }} />
+                      <li dangerouslySetInnerHTML={{ __html: t.raw('step4_4') }} />
+                      <li>{t('step4_5')}</li>
+                    </ol>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
+
+              <div className="mt-4 pt-4 border-t border-border">
+                <a
+                  href="https://developers.facebook.com/docs/whatsapp/cloud-api/get-started"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-sm text-primary hover:text-primary/80 transition-colors"
+                >
+                  <ExternalLink className="size-3.5" />
+                  {t('metaDocs')}
+                </a>
+              </div>
+            </CardContent>
+          </Card>
         </div>
       </div>
-
-      {/* Setup Instructions Sidebar */}
-      <div>
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-foreground text-base">{t('setupInstructions')}</CardTitle>
-            <CardDescription className="text-muted-foreground">
-              {t('setupInstructionsDesc')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Accordion>
-              <AccordionItem className="border-border">
-                <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
-                  <span className="flex items-center gap-2">
-                    <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">1</span>
-                    {t('step1')}
-                  </span>
-                </AccordionTrigger>
-                <AccordionContent className="text-muted-foreground">
-                  <ol className="list-decimal list-inside space-y-1 text-sm">
-                    <li dangerouslySetInnerHTML={{ __html: t('step1_1') }} />
-                    <li>{t('step1_2')}</li>
-                    <li>{t('step1_3')}</li>
-                    <li>{t('step1_4')}</li>
-                  </ol>
-                </AccordionContent>
-              </AccordionItem>
-
-              <AccordionItem className="border-border">
-                <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
-                  <span className="flex items-center gap-2">
-                    <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">2</span>
-                    {t('step2')}
-                  </span>
-                </AccordionTrigger>
-                <AccordionContent className="text-muted-foreground">
-                  <ol className="list-decimal list-inside space-y-1 text-sm">
-                    <li>{t('step2_1')}</li>
-                    <li>{t('step2_2')}</li>
-                    <li>{t('step2_3')}</li>
-                  </ol>
-                </AccordionContent>
-              </AccordionItem>
-
-              <AccordionItem className="border-border">
-                <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
-                  <span className="flex items-center gap-2">
-                    <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">3</span>
-                    {t('step3')}
-                  </span>
-                </AccordionTrigger>
-                <AccordionContent className="text-muted-foreground">
-                  <ol className="list-decimal list-inside space-y-1 text-sm">
-                    <li>{t('step3_1')}</li>
-                    <li dangerouslySetInnerHTML={{ __html: t.raw('step3_2') }} />
-                    <li dangerouslySetInnerHTML={{ __html: t.raw('step3_3') }} />
-                    <li dangerouslySetInnerHTML={{ __html: t.raw('step3_4') }} />
-                  </ol>
-                </AccordionContent>
-              </AccordionItem>
-
-              <AccordionItem className="border-border">
-                <AccordionTrigger className="text-muted-foreground hover:text-foreground hover:no-underline">
-                  <span className="flex items-center gap-2">
-                    <span className="flex size-5 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">4</span>
-                    {t('step4')}
-                  </span>
-                </AccordionTrigger>
-                <AccordionContent className="text-muted-foreground">
-                  <ol className="list-decimal list-inside space-y-1 text-sm">
-                    <li>{t('step4_1')}</li>
-                    <li>{t('step4_2')}</li>
-                    <li dangerouslySetInnerHTML={{ __html: t.raw('step4_3') }} />
-                    <li dangerouslySetInnerHTML={{ __html: t.raw('step4_4') }} />
-                    <li>{t('step4_5')}</li>
-                  </ol>
-                </AccordionContent>
-              </AccordionItem>
-            </Accordion>
-
-            <div className="mt-4 pt-4 border-t border-border">
-              <a
-                href="https://developers.facebook.com/docs/whatsapp/cloud-api/get-started"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm text-primary hover:text-primary/80 transition-colors"
-              >
-                <ExternalLink className="size-3.5" />
-                {t('metaDocs')}
-              </a>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
     </section>
   );
 }

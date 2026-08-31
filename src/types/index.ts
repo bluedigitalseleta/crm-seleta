@@ -275,9 +275,11 @@ export interface MessageReaction {
 export interface WhatsAppConfig {
   id: string;
   user_id: string;
-  phone_number_id: string;
+  provider: 'meta' | 'evolution';
+  provider_config: Record<string, any>;
+  phone_number_id?: string;
   waba_id?: string;
-  access_token: string;
+  access_token?: string;
   verify_token?: string;
   status: 'connected' | 'disconnected';
   connected_at?: string;

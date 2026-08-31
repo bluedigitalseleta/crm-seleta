@@ -7,6 +7,7 @@ import {
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
+import { createEvolutionInstance } from '@/lib/whatsapp/evolution-api'
 
 /**
  * Resolve the caller's account_id from their profile. Inlined here
@@ -87,7 +88,7 @@ export async function GET() {
 
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
-      .select('phone_number_id, access_token, status')
+      .select('provider, provider_config, phone_number_id, access_token, status')
       .eq('account_id', accountId)
       .maybeSingle()
 
@@ -110,11 +111,31 @@ export async function GET() {
       )
     }
 
+    if (config.provider === 'evolution') {
+      try {
+        const { getEvolutionInstanceStatus } = await import('@/lib/whatsapp/evolution-api')
+        const instanceName = config.provider_config?.instanceName
+        if (!instanceName) throw new Error('No instance name')
+        
+        const status = await getEvolutionInstanceStatus(instanceName)
+        const connected = status.instance?.state === 'open'
+        return NextResponse.json({ 
+          connected, 
+          phone_info: { verified_name: `Evolution: ${instanceName}` } 
+        })
+      } catch (err) {
+        return NextResponse.json(
+          { connected: false, reason: 'evolution_api_error', message: 'Failed to connect to Evolution API' },
+          { status: 200 }
+        )
+      }
+    }
+
     // Try to decrypt the stored token with the current ENCRYPTION_KEY.
     // If this fails, the key changed (or was never consistent across envs).
     let accessToken: string
     try {
-      accessToken = decrypt(config.access_token)
+      accessToken = decrypt(config.access_token!)
     } catch (err) {
       console.error('[whatsapp/config GET] Token decryption failed:', err)
       return NextResponse.json(
@@ -132,7 +153,7 @@ export async function GET() {
     // Validate credentials against Meta
     try {
       const phoneInfo = await verifyPhoneNumber({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phone_number_id!,
         accessToken,
       })
       return NextResponse.json({ connected: true, phone_info: phoneInfo })
@@ -185,7 +206,109 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
-    const { phone_number_id, waba_id, access_token, verify_token, pin } = body
+    const { provider = 'meta', instanceName, phone_number_id, waba_id, access_token, verify_token, pin } = body
+
+    if (provider === 'evolution') {
+      if (!instanceName || typeof instanceName !== 'string' || !instanceName.trim()) {
+        return NextResponse.json(
+          { error: 'instanceName is required for evolution provider' },
+          { status: 400 }
+        )
+      }
+
+      try {
+        const host = request.headers.get('host') || 'localhost:3000'
+        const protocol = request.headers.get('x-forwarded-proto') || 'http'
+        const webhookUrl = `${protocol}://${host}/api/whatsapp/evolution-webhook`
+
+        console.log(`[whatsapp/config POST] Creating Evolution instance ${instanceName} with webhook ${webhookUrl}`)
+        const instanceData = await createEvolutionInstance(instanceName, webhookUrl)
+        
+        const instance = instanceData.instance
+        // Evolution API returns QR code in different formats depending on version.
+        // Try multiple extraction paths to be robust.
+        const qrcode = instanceData.qrcode
+        let qrBase64: string | null = null
+        if (typeof qrcode === 'string') {
+          // Some versions return the base64 string directly
+          qrBase64 = qrcode
+        } else if (qrcode?.base64) {
+          // Common format: { base64: "..." }
+          qrBase64 = qrcode.base64
+        } else if (qrcode?.data) {
+          // Alternative: { data: "..." }
+          qrBase64 = qrcode.data
+        } else if (instanceData.base64) {
+          // Top-level fallback
+          qrBase64 = instanceData.base64
+        }
+
+        const baseRow = {
+          provider: 'evolution',
+          provider_config: {
+            instanceName: instance.instanceName,
+            instanceId: instance.instanceId,
+            apikey: instanceData.hash || '',
+          },
+          status: 'disconnected',
+          updated_at: new Date().toISOString(),
+        }
+
+        const { data: existing } = await supabase
+          .from('whatsapp_config')
+          .select('id')
+          .eq('account_id', accountId)
+          .maybeSingle()
+
+        if (existing) {
+          const { error: updateError } = await supabase
+            .from('whatsapp_config')
+            .update(baseRow)
+            .eq('account_id', accountId)
+
+          if (updateError) {
+            console.error('Error updating whatsapp_config:', updateError)
+            return NextResponse.json(
+              { error: 'Failed to update configuration' },
+              { status: 500 }
+            )
+          }
+        } else {
+          const { error: insertError } = await supabase
+            .from('whatsapp_config')
+            .insert({
+              account_id: accountId,
+              user_id: user.id,
+              ...baseRow,
+            })
+
+          if (insertError) {
+            console.error('Error inserting whatsapp_config:', insertError)
+            return NextResponse.json(
+              { error: 'Failed to save configuration' },
+              { status: 500 }
+            )
+          }
+        }
+
+        return NextResponse.json({
+          success: true,
+          saved: true,
+          qrcode: qrBase64,
+          instanceName: instance.instanceName,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown Evolution API error'
+        // Use the HTTP status from SendMessageError if available,
+        // otherwise default to 502 (Bad Gateway) for upstream failures.
+        const status = (err as { status?: number })?.status || 502
+        console.error('Evolution API instance creation failed:', message)
+        return NextResponse.json(
+          { error: message },
+          { status }
+        )
+      }
+    }
 
     if (!access_token || !phone_number_id) {
       return NextResponse.json(

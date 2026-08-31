@@ -22,6 +22,11 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
+  sendEvolutionTextMessage,
+  sendEvolutionMediaMessage,
+} from '@/lib/whatsapp/evolution-api';
+
+import {
   sendTextMessage,
   sendTemplateMessage,
   sendMediaMessage,
@@ -265,176 +270,147 @@ export async function sendMessageToConversation(
       400
     );
   }
+  // Send via Provider
+  let waMessageId = '';
+  let workingPhone = sanitizedPhone;
 
-  const accessToken = decrypt(config.access_token);
-
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
-      });
-  }
-
-  // Resolve the reply target to its Meta message_id. The parent must
-  // belong to this same conversation — otherwise a caller could quote
-  // messages they can't see by guessing UUIDs.
-  let contextMessageId: string | undefined;
-  if (replyToMessageId) {
-    const { data: parent, error: parentError } = await db
-      .from('messages')
-      .select('message_id, conversation_id')
-      .eq('id', replyToMessageId)
-      .eq('conversation_id', conversationId)
-      .maybeSingle();
-
-    if (parentError || !parent) {
-      throw new SendMessageError(
-        'bad_request',
-        'reply_to_message_id not found in this conversation',
-        400
-      );
+  if (config.provider === 'evolution') {
+    const instanceName = config.provider_config?.instanceName;
+    if (!instanceName) {
+      throw new SendMessageError('evolution_not_configured', 'Evolution instance name missing', 400);
     }
-    if (!parent.message_id) {
-      console.warn(
-        '[send-message] reply target has no Meta message_id; sending without context'
-      );
-    } else {
-      contextMessageId = parent.message_id;
+    
+    try {
+      if (messageType === 'text') {
+        const result = await sendEvolutionTextMessage(instanceName, sanitizedPhone, contentText!, contextMessageId);
+        waMessageId = result?.key?.id || `evo-${Date.now()}`;
+      } else if (isMediaKind) {
+        const result = await sendEvolutionMediaMessage(instanceName, sanitizedPhone, mediaUrl!, messageType, contentText, filename);
+        waMessageId = result?.key?.id || `evo-${Date.now()}`;
+      } else {
+        throw new SendMessageError('bad_request', `Evolution provider does not support ${messageType} yet`, 400);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[send-message] Evolution send failed:', message);
+      throw new SendMessageError('evolution_error', `Evolution API error: ${message}`, 502);
     }
-  }
+  } else {
+    // Meta Provider Logic
+    const accessToken = decrypt(config.access_token!);
+    
+    // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
+    if (isLegacyFormat(config.access_token!)) {
+      void db
+        .from('whatsapp_config')
+        .update({ access_token: encrypt(accessToken) })
+        .eq('id', config.id)
+        .then(({ error }: { error: { message: string } | null }) => {
+          if (error) {
+            console.warn(
+              '[send-message] access_token GCM upgrade failed:',
+              error.message
+            );
+          }
+        });
+    }
 
-  // Template row — needed for the send-builder's header + button
-  // components AND for the body we persist. The lookup tolerates the
-  // en / en_US split so a caller that omits the language still resolves
-  // a row (see resolveTemplateRow).
-  let templateRow: MessageTemplate | null = null;
-  let sendLanguage = templateLanguage || 'en_US';
-  if (messageType === 'template' && templateName) {
-    const resolved = await resolveTemplateRow(
-      db,
-      accountId,
-      templateName,
-      templateLanguage
-    );
-    if (resolved.malformed) {
-      throw new SendMessageError(
-        'template_malformed',
-        'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
-        500
-      );
-    }
-    templateRow = resolved.row;
-    sendLanguage = resolved.language;
-  }
-
-  const attempt = async (phone: string): Promise<string> => {
-    if (messageType === 'template') {
-      const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: templateName!,
-        language: sendLanguage,
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    if (isMediaKind) {
-      const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        kind: messageType as MediaKind,
-        link: mediaUrl!,
-        caption: contentText || undefined,
-        filename: filename || undefined,
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    if (messageType === 'interactive') {
-      const p = interactivePayload!;
-      if (p.kind === 'buttons') {
-        const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
+    const attempt = async (phone: string): Promise<string> => {
+      if (messageType === 'template') {
+        const result = await sendTemplateMessage({
+          phoneNumberId: config.phone_number_id!,
           accessToken,
           to: phone,
-          bodyText: p.body,
-          headerText: p.header || undefined,
-          footerText: p.footer || undefined,
-          buttons: p.buttons,
+          templateName: templateName!,
+          language: sendLanguage,
+          template: templateRow ?? undefined,
+          messageParams: templateMessageParams ?? undefined,
+          params: templateParams || [],
           contextMessageId,
         });
         return result.messageId;
       }
-      const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
+      if (isMediaKind) {
+        const result = await sendMediaMessage({
+          phoneNumberId: config.phone_number_id!,
+          accessToken,
+          to: phone,
+          kind: messageType as MediaKind,
+          link: mediaUrl!,
+          caption: contentText || undefined,
+          filename: filename || undefined,
+          contextMessageId,
+        });
+        return result.messageId;
+      }
+      if (messageType === 'interactive') {
+        const p = interactivePayload!;
+        if (p.kind === 'buttons') {
+          const result = await sendInteractiveButtons({
+            phoneNumberId: config.phone_number_id!,
+            accessToken,
+            to: phone,
+            bodyText: p.body,
+            headerText: p.header || undefined,
+            footerText: p.footer || undefined,
+            buttons: p.buttons,
+            contextMessageId,
+          });
+          return result.messageId;
+        }
+        const result = await sendInteractiveList({
+          phoneNumberId: config.phone_number_id!,
+          accessToken,
+          to: phone,
+          bodyText: p.body,
+          buttonLabel: p.button_label,
+          headerText: p.header || undefined,
+          footerText: p.footer || undefined,
+          sections: p.sections,
+          contextMessageId,
+        });
+        return result.messageId;
+      }
+      const result = await sendTextMessage({
+        phoneNumberId: config.phone_number_id!,
         accessToken,
         to: phone,
-        bodyText: p.body,
-        buttonLabel: p.button_label,
-        headerText: p.header || undefined,
-        footerText: p.footer || undefined,
-        sections: p.sections,
+        text: contentText!,
         contextMessageId,
       });
       return result.messageId;
-    }
-    const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: contentText!,
-      contextMessageId,
-    });
-    return result.messageId;
-  };
+    };
 
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
-  let waMessageId = '';
-  let workingPhone = sanitizedPhone;
-  try {
-    const variants = phoneVariants(sanitizedPhone);
-    let lastError: unknown = null;
+    // Send via Meta — retry across phone-number variants
+    try {
+      const variants = phoneVariants(sanitizedPhone);
+      let lastError: unknown = null;
 
-    for (const variant of variants) {
-      try {
-        waMessageId = await attempt(variant);
-        workingPhone = variant;
-        lastError = null;
-        break;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) {
-          throw err;
+      for (const variant of variants) {
+        try {
+          waMessageId = await attempt(variant);
+          workingPhone = variant;
+          lastError = null;
+          break;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (!isRecipientNotAllowedError(message)) {
+            throw err;
+          }
+          lastError = err;
+          console.warn(
+            `[send-message] variant "${variant}" rejected by Meta, trying next…`
+          );
         }
-        lastError = err;
-        console.warn(
-          `[send-message] variant "${variant}" rejected by Meta, trying next…`
-        );
       }
-    }
 
-    if (lastError) throw lastError;
-  } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+      if (lastError) throw lastError;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unknown Meta API error';
+      console.error('[send-message] Meta send failed for all variants:', message);
+      throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+    }
   }
 
   if (workingPhone !== sanitizedPhone) {
