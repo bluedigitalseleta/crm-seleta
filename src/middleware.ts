@@ -42,6 +42,40 @@ export async function middleware(request: NextRequest) {
     return response
   }
 
+  // ── DEBUG: Evolution API webhook header inspection ──
+  // Temporary — remove after confirming headers arrive correctly.
+  if (request.nextUrl.pathname.startsWith('/api/whatsapp/evolution-webhook')) {
+    console.log('[middleware] Evolution webhook headers:', Object.fromEntries(request.headers.entries()))
+  }
+
+  // Evolution API webhook — authenticate via the global API key header
+  // rather than a Supabase session.  The Evolution API sends the key as
+  // a lowercase `apikey` header (its default).  We compare against the
+  // server-only EVOLUTION_GLOBAL_API_KEY env var.  If the header is
+  // missing or mismatched we reject; otherwise we skip the rest of the
+  // middleware (session checks, redirects) and pass through.
+  if (request.nextUrl.pathname.startsWith('/api/whatsapp/evolution-webhook')) {
+    const inboundKey = request.headers.get('apikey') ?? request.headers.get('ApiKey') ?? ''
+    const expectedKey = process.env.EVOLUTION_GLOBAL_API_KEY ?? ''
+
+    if (!expectedKey) {
+      console.error('[middleware] EVOLUTION_GLOBAL_API_KEY is not set — rejecting webhook')
+      return withRefreshedCookies(
+        NextResponse.json({ error: 'Server misconfiguration' }, { status: 500 })
+      )
+    }
+
+    if (inboundKey !== expectedKey) {
+      console.warn('[middleware] Evolution webhook rejected — apikey mismatch. Received:', inboundKey ? `${inboundKey.slice(0, 4)}…` : '(empty)')
+      return withRefreshedCookies(
+        NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      )
+    }
+
+    // Key matches — let the request through without requiring a session.
+    return supabaseResponse
+  }
+
   // Auth pages - redirect to dashboard if already logged in.
   // Exception: when an invite token is in the query string we
   // send the already-signed-in user to /join/<token> instead so
@@ -79,7 +113,7 @@ export async function middleware(request: NextRequest) {
 
   // API routes that need auth (not webhooks)
   if (!user && request.nextUrl.pathname.startsWith('/api/whatsapp/') &&
-      !request.nextUrl.pathname.includes('/webhook')) {
+    !request.nextUrl.pathname.includes('/webhook')) {
     return withRefreshedCookies(
       NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     )
