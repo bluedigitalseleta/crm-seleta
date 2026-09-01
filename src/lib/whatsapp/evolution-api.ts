@@ -4,6 +4,24 @@ const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL || 'http://localhost:808
 const EVOLUTION_GLOBAL_API_KEY = process.env.EVOLUTION_GLOBAL_API_KEY || '';
 
 /**
+ * Ensure a Brazilian phone number includes the country code (55).
+ * Strips all non-digit characters, then prepends "55" when the
+ * resulting number has 10 or 11 digits (local format without DDI).
+ *
+ * Examples:
+ *   "85992091959"  → "5585992091959"
+ *   "+55 85 99209-1959" → "5585992091959"
+ *   "5585992091959" → "5585992091959"  (already has DDI)
+ */
+function ensureBrazilDDI(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 10 || digits.length === 11) {
+    return `55${digits}`;
+  }
+  return digits;
+}
+
+/**
  * Helper to make requests to Evolution API
  */
 async function fetchEvolution(endpoint: string, options: RequestInit = {}) {
@@ -160,7 +178,7 @@ export async function sendEvolutionTextMessage(
 ) {
   // Evolution API v2 expects `text` at the top level — NOT inside `textMessage`.
   const payload: any = {
-    number: to,
+    number: ensureBrazilDDI(to),
     text,
   };
 
@@ -187,7 +205,7 @@ export async function sendEvolutionMediaMessage(
   filename?: string | null
 ) {
   const payload: any = {
-    number: to,
+    number: ensureBrazilDDI(to),
     mediatype: mediaType,
     media: mediaUrl,
   };
