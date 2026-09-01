@@ -293,6 +293,17 @@ export async function sendMessageToConversation(
 
   if (config.provider === 'evolution') {
     const instanceName = config.provider_config?.instanceName;
+    
+    // ── DEBUG: log config state before Evolution send ──
+    console.log('[send-message] Evolution config:', {
+      provider: config.provider,
+      instanceName,
+      provider_config: config.provider_config,
+      messageType,
+      to: sanitizedPhone,
+      hasContentText: !!contentText,
+    });
+    
     if (!instanceName) {
       throw new SendMessageError('evolution_not_configured', 'Evolution instance name missing', 400);
     }

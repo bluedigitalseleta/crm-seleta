@@ -25,6 +25,13 @@ async function fetchEvolution(endpoint: string, options: RequestInit = {}) {
 
   const url = `${EVOLUTION_API_URL.replace(/\/$/, '')}${endpoint}`;
   
+  // ── DEBUG: log full request details before sending ──
+  console.log('[Evolution API] >>> Request:', {
+    url,
+    method: options.method ?? 'GET',
+    body: options.body ? JSON.parse(options.body as string) : undefined,
+  });
+  
   const headers = {
     'Content-Type': 'application/json',
     'apikey': EVOLUTION_GLOBAL_API_KEY,
@@ -151,11 +158,10 @@ export async function sendEvolutionTextMessage(
   text: string,
   replyToMessageId?: string | null
 ) {
+  // Evolution API v2 expects `text` at the top level — NOT inside `textMessage`.
   const payload: any = {
     number: to,
-    textMessage: {
-      text
-    }
+    text,
   };
 
   if (replyToMessageId) {
